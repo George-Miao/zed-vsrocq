@@ -1,0 +1,46 @@
+[package]
+name = "vsrocq-bridge"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+publish = false
+authors = ["George Miao <gm@miao.dev>"]
+repository = "https://github.com/George-Miao/zed-vsrocq"
+
+[dependencies]
+async-lsp = { version = "0.2.4", default-features = false, features = ["forward"] }
+axum = { version = "0.8", default-features = false, features = ["json", "http1"] }
+clap = { version = "4", features = ["derive"] }
+compio = { version = "0.19", features = ["runtime", "net", "time", "fs", "io-compat"] }
+cyper-core = "0.9"
+ez-jsonrpc-types = "0.5.2"
+flume = "0.11"
+futures-util = { version = "0.3", features = ["io"] }
+hyper = { version = "1", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["service", "server-graceful", "http1"] }
+process-wrap = { version = "10", default-features = false, features = ["std", "process-group", "job-object", "creation-flags"] }
+regex = "1"
+send_wrapper = { version = "0.6", features = ["futures"] }
+getrandom = { version = "0.3", features = ["std"] }
+serde = { version = "1", features = ["derive", "rc"] }
+serde-ignored-fields = "0.1.1"
+serde_json.workspace = true
+snafu.workspace = true
+tower-service = "0.3"
+url = "2"
+vsrocq-settings = { path = "../settings" }
+weavatrix-lsp-wire = "0.2"
+
+[build-dependencies]
+snafu.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+rustix = { version = "1", features = ["fs"] }
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.62", default-features = false, features = [
+  "Win32_Security_Authorization",
+  "Win32_Storage_FileSystem",
+  "Win32_System_Pipes",
+  "Win32_System_Threading",
+] }

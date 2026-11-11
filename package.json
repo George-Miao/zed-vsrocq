@@ -1,0 +1,13 @@
+{
+  "name": "vsrocq-proof-view",
+  "private": true,
+  "author": "George Miao <gm@miao.dev>",
+  "license": "MIT",
+  "type": "module",
+  "scripts": {
+    "check": "bun scripts/check-source.ts && tsc --project web/tsconfig.json"
+  },
+  "devDependencies": {
+    "typescript": "^5.9.3"
+  }
+}

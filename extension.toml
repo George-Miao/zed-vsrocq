@@ -1,0 +1,27 @@
+id = "vsrocq"
+name = "VsRocq"
+version = "0.1.0"
+schema_version = 1
+authors = ["George Miao <gm@miao.dev>"]
+description = "Rocq language support"
+repository = "https://github.com/George-Miao/zed-vsrocq"
+languages = ["languages/rocq"]
+
+[language_servers.vsrocq]
+name = "VsRocq"
+languages = ["Rocq"]
+language_ids = { Rocq = "coq" }
+
+[grammars.rocq]
+repository = "https://github.com/aruzdh/tree-sitter-rocq"
+rev = "300fe33fc299c30f736fd56d8ef8a28b08acd4e6"
+
+[[capabilities]]
+kind = "process:exec"
+command = "*"
+args = ["var", "bin", "**"]
+
+[[capabilities]]
+kind = "download_file"
+host = "*"
+path = ["**"]

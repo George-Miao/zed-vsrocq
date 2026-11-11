@@ -1,0 +1,18 @@
+# Build files and dependencies
+/target/
+/node_modules/
+*.rs.bk
+
+# Generated Zed extension files
+/extension.wasm
+/grammars/
+
+# Local Nix and development data
+/.direnv/
+/.data/
+/result
+/result-*
+
+# Operating system files
+.DS_Store
+Thumbs.db
