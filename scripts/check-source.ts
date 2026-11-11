@@ -14,7 +14,8 @@ async function check(directory: string): Promise<void> {
   for (const entry of await readdir(directory, { withFileTypes: true })) {
     const path = join(directory, entry.name);
     if (entry.isDirectory()) {
-      if (!excluded[entry.name]) await check(path);
+      // Zed downloads third-party grammar sources into this ignored directory.
+      if (path !== "grammars" && !excluded[entry.name]) await check(path);
     } else if ([".js", ".jsx", ".mjs", ".cjs"].includes(extname(entry.name))) {
       rejected.push(path);
     }

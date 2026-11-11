@@ -11,6 +11,8 @@
 (metavariable) @variable.special
 (wildcard) @variable.special
 (bullet) @punctuation.special
+; Qed and Admitted are named command nodes in the pinned grammar.
+[(qed_command) (admitted_command)] @keyword
 
 [
   "Require" "Import" "From" "Export"
@@ -18,7 +20,7 @@
   "Definition" "Example" "Fixpoint" "Inductive"
   "Axiom" "Axioms" "Conjecture" "Conjectures" "Parameter" "Parameters"
   "Hypothesis" "Hypotheses" "Variable" "Variables"
-  "Section" "Module" "End" "Proof" "Qed" "Defined" "Admitted" "Abort"
+  "Section" "Module" "End" "Proof" "Defined" "Abort"
   "Check" "Compute" "Print" "Search" "Locate"
   "Set" "Unset" "Arguments" "Notation" "Reserved" "Open" "Close" "Scope"
   "with"

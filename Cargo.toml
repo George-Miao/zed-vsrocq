@@ -28,3 +28,8 @@ serde_json.workspace = true
 snafu.workspace = true
 vsrocq-settings = { path = "crates/settings" }
 zed_extension_api = "0.7.0"
+
+[dev-dependencies]
+tree-sitter = "0.26.9"
+# Match the grammar revision in extension.toml.
+tree-sitter-rocq = { git = "https://github.com/aruzdh/tree-sitter-rocq", rev = "300fe33fc299c30f736fd56d8ef8a28b08acd4e6" }
