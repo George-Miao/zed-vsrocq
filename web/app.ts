@@ -42,7 +42,7 @@ const PP_TAGS: Record<string, true> = {
 type Command = "step-backward" | "step-forward" | "run-to-end" | "interrupt" | "reset";
 type GoalGroupKey = "goals" | "unfocusedGoals" | "shelvedGoals" | "givenUpGoals";
 type ProofStatus = "idle" | "checking" | "ready" | "error";
-type ConnectionKind = "connecting" | "connected" | "retrying" | "missing" | "unauthorized";
+type ConnectionKind = "connecting" | "connected" | "refreshing" | "retrying" | "blocked" | "missing" | "unauthorized";
 type RawObject = Record<string, unknown>;
 type Message = [number, unknown];
 
@@ -436,9 +436,12 @@ class ProofView {
     this.connection = kind;
     const notice = byId("connection-notice");
     const failedAuth = kind === "missing" || kind === "unauthorized";
-    notice.hidden = kind === "connected" || kind === "connecting";
-    notice.classList.toggle("danger", failedAuth);
-    byId("connection-title").textContent = failedAuth ? "Open a fresh proof view from Zed" : "Connection lost";
+    const blocked = kind === "blocked";
+    notice.hidden = kind === "connected" || kind === "connecting" || kind === "refreshing";
+    notice.classList.toggle("danger", failedAuth || blocked);
+    byId("connection-title").textContent = kind === "missing" ? "Open proof view from Zed" :
+      kind === "unauthorized" ? "Session link rejected" : blocked ? "Request blocked" : "Connection lost";
+    if (failedAuth || blocked) byId("command-notice").hidden = true;
     byId("connection-message").textContent = message;
     byId("reconnect").hidden = failedAuth;
     if (failedAuth && !this.state) {
@@ -457,6 +460,7 @@ class ProofView {
       label = this.pending === "reset" ? "Resetting" : "Checking";
     }
     if (this.connection === "connecting") label = "Connecting";
+    else if (this.connection === "refreshing") label = "Reading proof state";
     else if (this.connection !== "connected") {
       status = "disconnected";
       label = "Disconnected";
@@ -501,10 +505,11 @@ class ProofView {
     this.announce(`${COMMAND_LABELS[command]} requested. The previous proof view has been cleared.`);
   }
 
-  commandFailed(message: string): void {
+  commandFailed(message: string, title = "Command failed"): void {
     this.pending = null;
     if (this.state) this.render(this.state);
     byId("command-error").textContent = message;
+    byId("command-title").textContent = title;
     byId("command-notice").hidden = false;
     this.announce(message);
   }
@@ -807,12 +812,13 @@ class ProofSession {
     } catch (cause) {
       if (controller.signal.aborted) return;
       const error = cause instanceof ApiError ? cause : new ApiError("The local bridge request failed.");
-      if (error.status === 401 || error.status === 403) {
+      if (error.status === 401) {
         this.unauthorized = true;
-        this.view.setConnection("unauthorized", "This session link is no longer authorized. Open the proof view again from Zed to get a fresh private link.");
+        this.view.setConnection("unauthorized", "The bridge rejected this session link (HTTP 401). Use Open proof view in Zed.");
       } else {
         delay = Math.min(10000, 1000 * 2 ** Math.min(this.failures++, 4));
-        this.view.setConnection("retrying", `${error.message} Retrying in ${delay / 1000} ${delay === 1000 ? "second" : "seconds"}. Any goals still shown are from the last connection and may be out of date.`);
+        this.view.setConnection(error.status === 403 ? "blocked" : "retrying",
+          `${error.message} (HTTP ${error.status || "unavailable"}). Retrying in ${delay / 1000} ${delay === 1000 ? "second" : "seconds"}. The displayed proof state may be out of date.`);
       }
     } finally {
       if (this.pollController === controller) this.pollController = null;
@@ -835,11 +841,21 @@ class ProofSession {
     } catch (cause) {
       this.revision = null;
       const error = cause instanceof ApiError ? cause : new ApiError("The local bridge request failed.");
-      this.view.commandFailed(`${error.message} The command was not resent. The current proof state will be read again before another command.`);
-      if (error.status === 401 || error.status === 403) {
+      if (error.status === 401) {
         this.unauthorized = true;
-        this.view.setConnection("unauthorized", "This session link is no longer authorized. Open the proof view again from Zed.");
-      } else this.view.setConnection("retrying", "Reconnecting to read the current proof state. The last proof view may be out of date.");
+        this.view.pending = null;
+        if (this.view.state) this.view.render(this.view.state);
+        this.view.setConnection("unauthorized", "The bridge rejected this session link (HTTP 401). The command was not run. Use Open proof view in Zed.");
+      } else if (error.status === 403) {
+        this.view.commandFailed(
+          `The bridge rejected the request (HTTP 403): ${error.message}. The command was not run. Use the proof actions in Zed.`,
+          "Command blocked",
+        );
+        this.view.setConnection("refreshing");
+      } else {
+        this.view.commandFailed(`${error.message}. The command was not sent again. Reading the current proof state.`);
+        this.view.setConnection("refreshing");
+      }
     } finally {
       this.commandActive = false;
       this.schedule(0);
