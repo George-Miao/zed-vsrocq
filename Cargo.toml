@@ -27,7 +27,7 @@ serde.workspace = true
 serde_json.workspace = true
 snafu.workspace = true
 vsrocq-settings = { path = "crates/settings" }
-zed_extension_api = "0.7.0"
+zed_extension_api = { git = "https://github.com/zed-industries/zed", rev = "c4d75ea6d5887aee82e67888a1ac21e3bf9ccbdb" }
 
 [dev-dependencies]
 tree-sitter = "0.26.9"
