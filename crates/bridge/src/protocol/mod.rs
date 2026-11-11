@@ -1,4 +1,5 @@
 mod changes;
+pub(crate) mod inlay;
 mod proof;
 
 use std::collections::BTreeMap;
@@ -9,7 +10,7 @@ use async_lsp::lsp_types::{
 };
 pub(crate) use changes::{Change, ChangeParams};
 use ez_jsonrpc_types::template as rpc;
-pub(crate) use proof::{Diagnostics, ProofView};
+pub(crate) use proof::{Diagnostics, Highlights, ProofView};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_ignored_fields::{DeserializeIgnoredFields, PreserveIgnoredFields, SerializeIgnoredFields};
 use serde_json::value::{RawValue, to_raw_value};
@@ -242,6 +243,9 @@ pub(crate) struct WorkspaceCapabilities {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) configuration: Option<bool>,
 
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) inlay_hint: Option<InlayCapabilities>,
+
     #[serde(flatten)]
     extra: BTreeMap<String, Raw>,
 }
@@ -252,6 +256,36 @@ impl TryFrom<Fields> for WorkspaceCapabilities {
     fn try_from(mut fields: Fields) -> Result<Self> {
         Ok(Self {
             configuration: fields.take::<Option<bool>>("configuration")?.flatten(),
+            inlay_hint: fields.take::<Option<InlayCapabilities>>("inlayHint")?.flatten(),
+            extra: fields.rest(),
+        })
+    }
+}
+
+impl WorkspaceCapabilities {
+    pub(crate) fn refresh_support(&self) -> bool {
+        self.inlay_hint
+            .as_ref()
+            .is_some_and(|capabilities| capabilities.refresh_support == Some(true))
+    }
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", try_from = "Fields")]
+pub(crate) struct InlayCapabilities {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    refresh_support: Option<bool>,
+
+    #[serde(flatten)]
+    extra: BTreeMap<String, Raw>,
+}
+
+impl TryFrom<Fields> for InlayCapabilities {
+    type Error = Failure;
+
+    fn try_from(mut fields: Fields) -> Result<Self> {
+        Ok(Self {
+            refresh_support: fields.take::<Option<bool>>("refreshSupport")?.flatten(),
             extra: fields.rest(),
         })
     }
@@ -357,7 +391,9 @@ pub(crate) struct Empty {}
 
 #[cfg(test)]
 mod tests {
-    use super::{Fields, Initialize, InitializeInput, PositionEncodingKind, Raw, Sync, decode, raw};
+    use super::{
+        ClientCapabilities, Fields, Initialize, InitializeInput, PositionEncodingKind, Raw, Sync, decode, raw,
+    };
 
     #[test]
     fn initialization_changes_only_owned_settings_and_capabilities() {
@@ -368,7 +404,10 @@ mod tests {
             "initializationOptions":{"futureSetting":true},
             "capabilities":{
                 "general":{"positionEncodings":["utf-8"],"futureGeneral":[1,null]},
-                "workspace":{"configuration":false,"futureWorkspace":{"n":1.00e+2}},
+                "workspace":{
+                    "configuration":false,"futureWorkspace":{"n":1.00e+2},
+                    "inlayHint":{"refreshSupport":true,"futureInlay":{"opaque":1.00e+2}}
+                },
                 "experimental":{"opaque":["native",true]}
             },
             "workspaceFolders":[{"uri":"file:///workspace","name":"work","futureFolder":true}],
@@ -377,6 +416,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(input.settings.as_deref().unwrap().get(), r#"{"futureSetting":true}"#);
+        assert!(input.capabilities.workspace.refresh_support());
         let mut capabilities = input.capabilities;
         capabilities.general.position_encodings = vec![PositionEncodingKind::UTF16];
         capabilities.workspace.configuration = Some(true);
@@ -424,6 +464,28 @@ mod tests {
             workspace.take::<Raw>("futureWorkspace").unwrap().unwrap().get(),
             r#"{"n":1.00e+2}"#
         );
+        let mut inlay: Fields = workspace.take("inlayHint").unwrap().unwrap();
+        assert_eq!(inlay.take::<bool>("refreshSupport").unwrap(), Some(true));
+        assert_eq!(
+            inlay.take::<Raw>("futureInlay").unwrap().unwrap().get(),
+            r#"{"opaque":1.00e+2}"#
+        );
+    }
+
+    #[test]
+    fn refresh_support_requires_an_explicit_client_capability() {
+        for wire in [
+            r#"{}"#,
+            r#"{"workspace":null}"#,
+            r#"{"workspace":{}}"#,
+            r#"{"workspace":{"inlayHint":null}}"#,
+            r#"{"workspace":{"inlayHint":{}}}"#,
+            r#"{"workspace":{"inlayHint":{"refreshSupport":null}}}"#,
+            r#"{"workspace":{"inlayHint":{"refreshSupport":false}}}"#,
+        ] {
+            let capabilities: ClientCapabilities = serde_json::from_str(wire).unwrap();
+            assert!(!capabilities.workspace.refresh_support(), "{wire}");
+        }
     }
 
     #[test]

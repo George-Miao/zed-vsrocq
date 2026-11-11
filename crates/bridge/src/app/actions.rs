@@ -104,6 +104,9 @@ pub(super) struct Capabilities {
     execute_command_provider: Option<Commands>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) inlay_hint_provider: Option<protocol::inlay::Provider>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) position_encoding: Option<PositionEncodingKind>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -120,6 +123,9 @@ impl TryFrom<Fields> for Capabilities {
         Ok(Self {
             code_action_provider: fields.take::<Option<Provider>>("codeActionProvider")?.flatten(),
             execute_command_provider: fields.take::<Option<Commands>>("executeCommandProvider")?.flatten(),
+            inlay_hint_provider: fields
+                .take::<Option<protocol::inlay::Provider>>("inlayHintProvider")?
+                .flatten(),
             position_encoding: fields
                 .take::<Option<PositionEncodingKind>>("positionEncoding")?
                 .flatten(),

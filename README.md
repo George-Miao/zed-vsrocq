@@ -19,11 +19,28 @@ Open a `.v` file as Rocq. Open Zed's code-action menu and select a `VsRocq:` act
 - Interrupt or reset.
 - Open proof view.
 
-An explicit proof command opens the browser by default.
+The first proof command opens the browser by default. Other proof commands use the same view. Select `Open proof view` to open it again.
 
 ### `.v` association
 
 This extension associates `.v` files to Rocq. Verilog also uses that file extension. If both extensions are installed, select Rocq for proof files or set a project-level language association.
+
+### Proof progress in Zed
+
+Enable inlay hints in Zed to show `Checked to here` and `Checking...` beside the proof:
+
+```json
+{
+  "languages": {
+    "Rocq": {
+      "inlay_hints": {
+        "enabled": true,
+        "show_other_hints": true
+      }
+    }
+  }
+}
+```
 
 ## Config
 
@@ -49,7 +66,7 @@ The following keys are relative to `settings`:
 | Key                         | Use                                                                                                                 |
 | --------------------------- | ------------------------------------------------------------------------------------------------------------------- |
 | `proof.block`               | Stop at the first error. Set to `false` to continue checking. Default: `true`.                                      |
-| `proof.autoOpen`            | Open the browser for explicit proof commands. Set to `false` to open it only with the open action. Default: `true`. |
+| `proof.autoOpen`            | Open the browser once per language-server session. Set to `false` to use only the open action. Default: `true`. |
 | `server.path`               | Select a Rocq language-server executable outside the detected toolchain.                                            |
 | `server.args`               | Supply arguments for that executable.                                                                               |
 | `bridge.path`               | Select a local bridge executable instead of downloading one.                                                        |

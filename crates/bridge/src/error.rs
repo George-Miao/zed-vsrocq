@@ -82,6 +82,15 @@ pub(crate) enum Error {
     #[snafu(display("invalid VsRocq proof view: {source}"))]
     InvalidProofView { source: protocol::Failure },
 
+    #[snafu(display("invalid VsRocq highlight snapshot: {source}"))]
+    InvalidHighlights { source: protocol::Failure },
+
+    #[snafu(display("VsRocq highlight range is reversed: {range:?}"))]
+    ReversedHighlightRange { range: async_lsp::lsp_types::Range },
+
+    #[snafu(display("VsRocq highlight range is outside its proof document: {source}"))]
+    HighlightPosition { source: document::Error },
+
     #[snafu(display("VsRocq documentProofs returned an unknown result shape: {source}"))]
     InvalidDocumentProofs { source: protocol::Failure },
 

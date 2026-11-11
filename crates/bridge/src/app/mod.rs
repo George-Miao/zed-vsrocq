@@ -1,4 +1,5 @@
 mod actions;
+mod inlay;
 mod lsp;
 
 use std::{
@@ -14,7 +15,7 @@ use async_lsp::{
     ClientSocket, MainLoop,
     lsp_types::{
         ConfigurationParams, DidCloseTextDocumentParams, DidOpenTextDocumentParams, DidSaveTextDocumentParams,
-        MessageActionItem, MessageType, PositionEncodingKind, ShowDocumentParams, ShowMessageParams,
+        InlayHintParams, MessageActionItem, MessageType, PositionEncodingKind, ShowDocumentParams, ShowMessageParams,
         ShowMessageRequestParams,
     },
 };
@@ -36,8 +37,8 @@ use crate::{
     process::{Reaper, Role, Server},
     protocol::{
         self, AtDocument, BlockOnError, Change, ChangeParams, Diagnostics, DocumentParams, DocumentProofs, DocumentRef,
-        DocumentState, Empty, Fields, Id, Initialize, InitializeInput, Message, ProofView, Raw, Request, Response,
-        VersionedDocument,
+        DocumentState, Empty, Fields, Highlights, Id, Initialize, InitializeInput, Message, ProofView, Raw, Request,
+        Response, VersionedDocument,
     },
 };
 
@@ -165,6 +166,8 @@ struct ProofSession {
     expected: Option<Target>,
     reset_request: Option<String>,
     diagnostics: Vec<String>,
+    highlights: Option<Highlights>,
+    blocked: Option<Position>,
 }
 
 struct ProofAction {
@@ -179,6 +182,7 @@ enum Pending {
     Shutdown,
     Forward,
     CodeActions(Vec<actions::LocalAction>),
+    InlayHints(inlay::Query),
     Internal,
 }
 
@@ -186,6 +190,7 @@ enum Pending {
 enum ClientRequest {
     Open,
     Setup,
+    InlayRefresh,
 }
 
 #[derive(Debug, Default, Deserialize, Serialize)]
@@ -237,12 +242,17 @@ struct App {
     replies: HashMap<Id, Sender<lsp::Reply>>,
     state: RefCell<BrowserState>,
     proof_url: String,
+    browser_opened: bool,
     reaper: Reaper,
     documents: HashMap<String, Rc<Document>>,
     primary: Option<Server>,
     primary_epoch: u64,
     primary_ready: bool,
     native_actions: bool,
+    native_hints: bool,
+    native_hint_resolve: bool,
+    hints: inlay::Hints,
+    hint_refresh: inlay::Refresh,
     recovering: bool,
     primary_queue: VecDeque<Request>,
     pending: HashMap<Id, Pending>,
@@ -270,12 +280,17 @@ pub(crate) async fn run(options: Options) -> Result<()> {
         replies: HashMap::new(),
         state: RefCell::new(BrowserState::default()),
         proof_url: service.url(),
+        browser_opened: false,
         reaper: reaper.clone(),
         documents: HashMap::new(),
         primary: None,
         primary_epoch: 0,
         primary_ready: false,
         native_actions: false,
+        native_hints: false,
+        native_hint_resolve: false,
+        hints: inlay::Hints::default(),
+        hint_refresh: inlay::Refresh::default(),
         recovering: false,
         primary_queue: VecDeque::new(),
         pending: HashMap::new(),
@@ -361,6 +376,11 @@ impl App {
             Message::Response(response) => {
                 if let Id::String(id) = &response.id {
                     if let Some(request) = self.client_requests.remove(id) {
+                        if matches!(request, ClientRequest::InlayRefresh) {
+                            self.hint_refresh.complete(response.result.is_ok());
+                            self.refresh_hints();
+                            return Ok(());
+                        }
                         if matches!(request, ClientRequest::Setup)
                             && protocol::result::<Option<MessageActionItem>>(&response)
                                 .ok()
@@ -396,6 +416,8 @@ impl App {
             if let Err(error) = self.config.update(input.settings.as_deref().unwrap_or(RawValue::NULL)) {
                 return self.response_failure(id, -32602, &error);
             }
+            self.hint_refresh
+                .support(input.capabilities.workspace.refresh_support());
             let mut capabilities = input.capabilities;
             capabilities.general.position_encodings = vec![PositionEncodingKind::UTF16];
             self.initialize_params = Some(Initialize {
@@ -413,6 +435,7 @@ impl App {
         }
         if method == "initialized" {
             self.initialized = true;
+            self.refresh_hints();
             self.ask_setup()?;
         }
         if method == "workspace/didChangeConfiguration" {
@@ -422,7 +445,7 @@ impl App {
                 self.show_failure(&error)?;
                 return Ok(());
             }
-            self.proofs.clear();
+            self.clear_proofs();
             self.clear_current(Status::Idle);
             request.params = Some(protocol::raw(&ConfigurationChange {
                 settings: self.config.server_settings(),
@@ -453,6 +476,7 @@ impl App {
                             state.status = Status::Idle;
                         });
                     }
+                    self.hints.open(&document);
                     self.documents.insert(document.uri.clone(), Rc::new(document));
                 }
                 Err(error) => self.show_failure(&error)?,
@@ -478,6 +502,7 @@ impl App {
                 Err(error) => {
                     let error = Arc::new(error);
                     self.documents.remove(&uri);
+                    self.hints.close(&uri);
                     self.state(|state| {
                         state.proof = None;
                         state.status = Status::Error;
@@ -492,6 +517,9 @@ impl App {
                 content_changes: changes,
                 extra: input.extra,
             })?);
+            if let Some(document) = self.documents.get(&uri) {
+                self.hints.open(document);
+            }
             if self.view_is(&uri) {
                 let label = self.documents.get(&uri).map(|document| document.label());
                 self.state(|state| {
@@ -506,6 +534,7 @@ impl App {
             let uri = params.text_document.uri.as_str();
             self.invalidate_proof(uri);
             self.documents.remove(uri);
+            self.hints.close(uri);
             if self.view_is(uri) {
                 self.state(|state| {
                     state.document = None;
@@ -520,7 +549,7 @@ impl App {
         }
         if method == "shutdown" {
             self.shutting_down = true;
-            self.proofs.clear();
+            self.clear_proofs();
             if self.primary.is_some() {
                 self.forward(request, Pending::Shutdown)?;
             } else if let Some(id) = request.id {
@@ -556,6 +585,43 @@ impl App {
                 return self.forward(request, Pending::CodeActions(actions));
             }
             return self.response(id, &actions);
+        }
+        if method == "textDocument/inlayHint" {
+            let id = request
+                .id
+                .clone()
+                .context(error::MissingRequestIdSnafu { method: "inlayHint" })?;
+            let params: InlayHintParams = match protocol::params(&request) {
+                Ok(params) => params,
+                Err(error) => return self.response_failure(id, -32602, &error),
+            };
+            if params.range.start > params.range.end {
+                return self.response_error(id, -32602, "The inlay hint range is reversed");
+            }
+            let query = self.hints.query(params.text_document.uri.to_string(), params.range);
+            if self.primary.is_some() && self.native_hints {
+                return self.forward(request, Pending::InlayHints(query));
+            }
+            return self.inlay_response(&query, protocol::reply(id, &Vec::<Raw>::new())?);
+        }
+        if method == "inlayHint/resolve" {
+            let id = request.id.clone().context(error::MissingRequestIdSnafu {
+                method: "inlayHint/resolve",
+            })?;
+            let hint = request.params.as_deref().unwrap_or(RawValue::NULL);
+            match protocol::inlay::resolve(hint) {
+                Ok(Some(resolved)) => {
+                    if !self.hints.resolves(&resolved) {
+                        return self.response_error(id, -32801, "The proof progress hint is no longer current");
+                    }
+                    return self.response(id, hint);
+                }
+                Ok(None) if self.primary.is_some() && self.native_hint_resolve => {
+                    return self.forward(request, Pending::Forward);
+                }
+                Ok(None) => return self.response_error(id, -32601, "Native inlay hint resolution is not supported"),
+                Err(error) => return self.response_failure(id, -32602, &error),
+            }
         }
         if !(self.recovering
             && matches!(
@@ -626,6 +692,8 @@ impl App {
         self.primary = Some(primary);
         self.primary_ready = false;
         self.recovering = recover;
+        self.native_hints = false;
+        self.native_hint_resolve = false;
         Ok(())
     }
 
@@ -717,6 +785,7 @@ impl App {
             Some(Pending::CodeActions(actions)) => {
                 self.output(Message::Response(actions::merge_response(response, actions)?))
             }
+            Some(Pending::InlayHints(query)) => self.inlay_response(&query, response),
             Some(Pending::Forward) | None => self.output(Message::Response(response)),
         }
     }
@@ -724,12 +793,25 @@ impl App {
     fn capabilities(&mut self, mut result: Initialization) -> Initialization {
         let capabilities = &mut result.capabilities;
         self.native_actions = actions::advertise(capabilities);
+        self.native_hint_resolve = capabilities
+            .inlay_hint_provider
+            .as_ref()
+            .is_some_and(protocol::inlay::Provider::resolve_support);
+        self.native_hints = protocol::inlay::advertise(&mut capabilities.inlay_hint_provider);
         capabilities.position_encoding = Some(PositionEncodingKind::UTF16);
         capabilities
             .text_document_sync
             .get_or_insert_with(Default::default)
             .normalize();
         result
+    }
+
+    fn inlay_response(&mut self, query: &inlay::Query, response: Response) -> Result<()> {
+        let id = response.id.clone();
+        match self.hints.response(query, response) {
+            Ok(response) => self.output(Message::Response(response)),
+            Err(error) => self.response_failure(id, -32603, &error),
+        }
     }
 
     fn command(&mut self, input: CommandInput, explicit: bool, save: bool) -> Result<()> {
@@ -785,7 +867,13 @@ impl App {
                 state.status = status;
             });
         }
-        if explicit && input.source != Source::Browser && (input.command == "open" || self.config.auto_open) {
+        if should_open_browser(
+            explicit,
+            input.source,
+            &input.command,
+            self.config.auto_open,
+            self.browser_opened,
+        ) {
             self.open_browser()?;
         }
         if input.command == "open" {
@@ -796,7 +884,7 @@ impl App {
             // The server may not implement RPC interruption. Termination stops
             // both the visible check and mirrored execution, including prover
             // workers.
-            self.proofs.clear();
+            self.clear_proofs();
             if self.primary.is_some() {
                 self.stop_primary("VsRocq execution interrupted")?;
                 let id = Id::String(self.next_id());
@@ -875,17 +963,23 @@ impl App {
                 expected: None,
                 reset_request: None,
                 diagnostics: Vec::new(),
+                highlights: None,
+                blocked: None,
             });
         }
         if let Some(proof) = self.proofs.get_mut(&document.uri) {
             proof.last_view = None;
             proof.expected = None;
             proof.reset_request = None;
+            proof.highlights = None;
+            proof.blocked = None;
             proof.queued.push_back(ProofAction {
                 command: input.command,
                 position,
             });
+            self.hints.start(&document.uri, document.version, proof.epoch);
         }
+        self.hints_changed();
         if let Err(error) = self.dispatch_proof(&document.uri) {
             let error = Arc::new(error);
             self.proof_error(&document.uri, error.clone());
@@ -958,8 +1052,11 @@ impl App {
         if let Some(proof) = self.proofs.get_mut(uri) {
             proof.expected = Some(target);
             proof.reset_request = reset_request;
+            proof.highlights = None;
+            proof.blocked = None;
             proof.server.send(&proof_message)?;
         }
+        self.hints_changed();
         Ok(())
     }
 
@@ -1011,6 +1108,16 @@ impl App {
                 }
                 return Ok(());
             }
+            "prover/updateHighlights" => {
+                let highlights: Highlights = protocol::params(&request).context(error::InvalidHighlightsSnafu)?;
+                if highlights.uri != document.uri {
+                    return Ok(());
+                }
+                if let Some(proof) = self.proofs.get_mut(&document.uri) {
+                    proof.highlights = Some(highlights);
+                }
+                return self.publish_hints(&document.uri);
+            }
             "textDocument/publishDiagnostics" => {
                 let params: Diagnostics = protocol::params(&request)?;
                 if params.uri != document.uri || params.version.is_some_and(|version| version != document.version) {
@@ -1018,7 +1125,13 @@ impl App {
                 }
                 if let Some(proof) = self.proofs.get_mut(&document.uri) {
                     proof.diagnostics = params.errors();
+                    if !proof.diagnostics.is_empty() {
+                        if let Some(highlights) = &mut proof.highlights {
+                            highlights.processing_range.clear();
+                        }
+                    }
                 }
+                self.publish_hints(&document.uri)?;
                 self.publish_proof(&document.uri);
                 return self.dispatch_proof(&document.uri);
             }
@@ -1027,13 +1140,20 @@ impl App {
                 if params.uri != document.uri {
                     return Ok(());
                 }
-                if let Some(navigation) = self
-                    .proofs
-                    .get_mut(&document.uri)
-                    .and_then(|proof| proof.navigation.as_mut())
-                {
-                    navigation.blocked(&document, params.range)?;
+                document
+                    .validate_position(params.range.start)
+                    .context(error::HighlightPositionSnafu)?;
+                if let Some(proof) = self.proofs.get_mut(&document.uri) {
+                    proof.blocked = Some(params.range.start);
+                    if let Some(highlights) = &mut proof.highlights {
+                        highlights.processing_range.clear();
+                    }
+                    if let Some(navigation) = &mut proof.navigation {
+                        navigation.blocked(&document, params.range)?;
+                    }
                 }
+                self.publish_hints(&document.uri)?;
+                self.hints_changed();
                 return Ok(());
             }
             "prover/proofView" => {
@@ -1043,13 +1163,36 @@ impl App {
                     return Ok(());
                 }
                 if let Some(proof) = self.proofs.get_mut(&document.uri) {
+                    if view.failed() {
+                        proof.blocked = Some(
+                            proof
+                                .blocked
+                                .map_or(view.range.start, |blocked| blocked.min(view.range.start)),
+                        );
+                    }
+                    if let Some(highlights) = &mut proof.highlights {
+                        highlights.processing_range.clear();
+                    }
                     proof.last_view = Some(Rc::new(view));
                 }
                 self.publish_proof(&document.uri);
+                self.publish_hints(&document.uri)?;
+                self.hints_changed();
                 return Ok(());
             }
             "window/showMessage" => {
                 let params: ShowMessageParams = protocol::params(&request)?;
+                if params.typ == MessageType::ERROR {
+                    if let Some(highlights) = self
+                        .proofs
+                        .get_mut(&document.uri)
+                        .and_then(|proof| proof.highlights.as_mut())
+                    {
+                        highlights.processing_range.clear();
+                    }
+                    self.hints.stop_checking(&document.uri);
+                    self.hints_changed();
+                }
                 if params.typ == MessageType::ERROR && self.view_is(&document.uri) {
                     self.state(|state| {
                         state.status = Status::Error;
@@ -1160,8 +1303,12 @@ impl App {
             if let Some(proof) = self.proofs.get_mut(&document.uri) {
                 proof.reset_request = None;
                 proof.last_view = None;
+                proof.highlights = None;
+                proof.blocked = None;
             }
             self.publish_proof(&document.uri);
+            self.publish_hints(&document.uri)?;
+            self.hints_changed();
         }
         Ok(())
     }
@@ -1200,7 +1347,7 @@ impl App {
             }
             return Ok(());
         }
-        self.proofs.clear();
+        self.clear_proofs();
         if was_ready {
             self.state(|state| {
                 state.proof = None;
@@ -1246,6 +1393,61 @@ impl App {
         // process epoch rejects output already queued before termination,
         // including untagged proof views.
         self.proofs.remove(uri);
+        self.hints.clear(uri);
+        self.hints_changed();
+    }
+
+    fn clear_proofs(&mut self) {
+        self.proofs.clear();
+        self.hints.clear_all();
+        self.hints_changed();
+    }
+
+    fn publish_hints(&mut self, uri: &str) -> Result<()> {
+        let Some(proof) = self.proofs.get(uri) else {
+            return Ok(());
+        };
+        let Some(document) = self.documents.get(uri) else {
+            return Ok(());
+        };
+        if !accept_proof(proof.epoch, proof.epoch, uri, proof.version, document) {
+            return Ok(());
+        }
+        let progress = match &proof.highlights {
+            Some(highlights) => inlay::Progress::snapshot(
+                document,
+                proof.navigation.as_ref(),
+                highlights,
+                proof.expected,
+                proof.blocked,
+            )?,
+            None => inlay::Progress::default(),
+        };
+        if self.hints.update(uri, proof.version, proof.epoch, progress) {
+            self.hints_changed();
+        }
+        Ok(())
+    }
+
+    fn hints_changed(&mut self) {
+        self.hint_refresh.changed();
+        self.refresh_hints();
+    }
+
+    fn refresh_hints(&mut self) {
+        if !self.initialized || self.shutting_down || !self.hint_refresh.request() {
+            return;
+        }
+        let id = self.next_id();
+        self.client_requests.insert(id.clone(), ClientRequest::InlayRefresh);
+        let request = protocol::request("workspace/inlayHint/refresh", Some(Id::String(id.clone())), &());
+        let sent = request
+            .map_err(Error::from)
+            .and_then(|request| self.output(Message::Request(request)));
+        if sent.is_err() {
+            self.client_requests.remove(&id);
+            self.hint_refresh.complete(false);
+        }
     }
 
     fn view_is(&self, uri: &str) -> bool {
@@ -1339,7 +1541,9 @@ impl App {
     }
 
     fn open_browser(&mut self) -> Result<()> {
-        self.open_url(self.proof_url.clone())
+        self.open_url(self.proof_url.clone())?;
+        self.browser_opened = true;
+        Ok(())
     }
 
     fn open_url(&mut self, url: String) -> Result<()> {
@@ -1399,6 +1603,10 @@ fn accept_proof(epoch: u64, session_epoch: u64, uri: &str, version: i64, documen
     epoch == session_epoch && uri == document.uri && version == document.version
 }
 
+fn should_open_browser(explicit: bool, source: Source, command: &str, auto_open: bool, opened: bool) -> bool {
+    explicit && source == Source::Editor && (command == "open" || (auto_open && !opened))
+}
+
 fn proof_presentation(view: Option<&ProofView>, diagnostics: &[String], top_ready: bool) -> (Status, Option<String>) {
     let error = (!diagnostics.is_empty()).then(|| diagnostics.join("\n\n"));
     let status = if error.is_some() || view.is_some_and(ProofView::failed) {
@@ -1417,10 +1625,20 @@ fn browser_target(document: Option<&Label>, uri: Option<&str>, version: Option<i
 
 #[cfg(test)]
 mod tests {
-    use super::{Status, accept_proof, browser_target, proof_presentation};
+    use std::{cell::RefCell, collections::HashMap, ffi::OsString, path::PathBuf, rc::Rc};
+
+    use async_lsp::{MainLoop, lsp_types::InlayHint};
+
+    use super::{
+        App, BrowserState, ClientRequest, Source, Status, accept_proof, browser_target, inlay, lsp, proof_presentation,
+        should_open_browser,
+    };
     use crate::{
-        document::Document,
-        protocol::{Diagnostics, ProofView},
+        cli::Options,
+        config::Config,
+        document::{Document, Position},
+        process::Reaper,
+        protocol::{self, Diagnostics, Id, Message, ProofView, Raw, Request},
     };
 
     #[test]
@@ -1469,5 +1687,217 @@ mod tests {
     fn known_top_requires_reset_completion_and_never_reuses_an_old_view() {
         assert_eq!(proof_presentation(None, &[], false), (Status::Checking, None));
         assert_eq!(proof_presentation(None, &[], true), (Status::Ready, None));
+    }
+
+    fn with_app(test: impl FnOnce(&mut App)) {
+        let options = Options {
+            root: PathBuf::from("."),
+            server: OsString::from("unused-test-server"),
+            args: Vec::new(),
+        };
+        let (tx, _rx) = flume::unbounded();
+        let (_main_loop, _socket) = MainLoop::new_server(|socket| {
+            let mut app = App {
+                root: options.root.clone(),
+                config: Config::new(&options),
+                tx,
+                socket,
+                replies: HashMap::new(),
+                state: RefCell::new(BrowserState::default()),
+                proof_url: "http://127.0.0.1:1/".into(),
+                browser_opened: false,
+                reaper: Reaper::default(),
+                documents: HashMap::new(),
+                primary: None,
+                primary_epoch: 0,
+                primary_ready: false,
+                native_actions: false,
+                native_hints: false,
+                native_hint_resolve: false,
+                hints: inlay::Hints::default(),
+                hint_refresh: inlay::Refresh::default(),
+                recovering: false,
+                primary_queue: Default::default(),
+                pending: HashMap::new(),
+                initialize_params: None,
+                initialized: false,
+                proofs: HashMap::new(),
+                proof_epoch: 0,
+                client_requests: HashMap::new(),
+                request_serial: 0,
+                request_prefix: "test-request-prefix".into(),
+                setup_asked: false,
+                shutting_down: false,
+            };
+            test(&mut app);
+            app
+        });
+    }
+
+    fn notify(app: &mut App, method: &str, params: &str) {
+        app.client(Message::Request(Request {
+            method: method.into(),
+            params: Some(serde_json::from_str(params).unwrap()),
+            id: None,
+        }))
+        .unwrap();
+    }
+
+    fn request(app: &mut App, method: &str, params: Raw) -> lsp::Reply {
+        let id = Id::Number(42.into());
+        let (reply, response) = flume::bounded(1);
+        app.replies.insert(id.clone(), reply);
+        app.client(Message::Request(Request {
+            method: method.into(),
+            params: Some(params),
+            id: Some(id),
+        }))
+        .unwrap();
+        response.try_recv().unwrap()
+    }
+
+    fn inlays(app: &mut App, uri: &str, start: Position, end: Position) -> Vec<Raw> {
+        let params = async_lsp::lsp_types::InlayHintParams {
+            text_document: async_lsp::lsp_types::TextDocumentIdentifier {
+                uri: uri.parse().unwrap(),
+            },
+            range: async_lsp::lsp_types::Range::new(start, end),
+            work_done_progress_params: Default::default(),
+        };
+        let response = request(app, "textDocument/inlayHint", protocol::raw(&params).unwrap())
+            .unwrap()
+            .unwrap();
+        protocol::decode(&response).unwrap()
+    }
+
+    #[test]
+    fn editor_inlay_requests_work_without_native_support_and_clear_after_document_lifecycle_changes() {
+        with_app(|app| {
+            let uri = "file:///proof.v";
+            notify(
+                app,
+                "textDocument/didOpen",
+                r#"{"textDocument":{"uri":"file:///proof.v","languageId":"rocq","version":1,"text":"Check nat.\nCheck bool."}}"#,
+            );
+            app.hints.start(uri, 1, 3);
+            app.hints.update(uri, 1, 3, inlay::Progress {
+                checked: Some(Position::new(0, 10)),
+                checking: Some(Position::new(1, 11)),
+            });
+            let hints = inlays(app, uri, Position::new(0, 10), Position::new(0, 10));
+            assert_eq!(hints.len(), 1);
+            let hint: InlayHint = protocol::decode(&hints[0]).unwrap();
+            assert_eq!(hint.position, Position::new(0, 10));
+            assert!(hint.kind.is_none());
+            assert!(app.pending.is_empty());
+            assert!(inlays(app, "file:///other.v", Position::new(0, 0), Position::new(1, 11)).is_empty());
+            notify(
+                app,
+                "textDocument/didChange",
+                r#"{"textDocument":{"uri":"file:///proof.v","version":2},"contentChanges":[{"text":"Check bool."}]}"#,
+            );
+            assert!(inlays(app, uri, Position::new(0, 0), Position::new(0, 11)).is_empty());
+            app.hints.start(uri, 2, 4);
+            app.hints.update(uri, 2, 4, inlay::Progress {
+                checked: Some(Position::new(0, 11)),
+                checking: None,
+            });
+            assert_eq!(inlays(app, uri, Position::new(0, 0), Position::new(0, 11)).len(), 1);
+            notify(
+                app,
+                "textDocument/didClose",
+                r#"{"textDocument":{"uri":"file:///proof.v"}}"#,
+            );
+            assert!(inlays(app, uri, Position::new(0, 0), Position::new(0, 11)).is_empty());
+            notify(
+                app,
+                "textDocument/didOpen",
+                r#"{"textDocument":{"uri":"file:///proof.v","languageId":"rocq","version":2,"text":"Check bool."}}"#,
+            );
+            assert!(inlays(app, uri, Position::new(0, 0), Position::new(0, 11)).is_empty());
+        });
+    }
+
+    #[test]
+    fn synthetic_hint_resolution_stays_local_and_rejects_moved_or_reset_progress() {
+        with_app(|app| {
+            let document = Rc::new(Document {
+                uri: "file:///proof.v".into(),
+                language: "rocq".into(),
+                version: 1,
+                text: "Check nat.\nCheck bool.".into(),
+            });
+            app.hints.open(&document);
+            app.documents.insert(document.uri.clone(), document.clone());
+            app.hints.start(&document.uri, 1, 3);
+            app.hints.update(&document.uri, 1, 3, inlay::Progress {
+                checked: Some(Position::new(0, 10)),
+                checking: None,
+            });
+            let hint = inlays(app, &document.uri, Position::new(0, 0), Position::new(1, 11))
+                .pop()
+                .unwrap();
+            let resolved = request(app, "inlayHint/resolve", hint.clone()).unwrap().unwrap();
+            assert_eq!(resolved.get(), hint.get());
+            app.hints.update(&document.uri, 1, 3, inlay::Progress {
+                checked: None,
+                checking: Some(Position::new(1, 11)),
+            });
+            let lsp::ReplyError::Native { source } = request(app, "inlayHint/resolve", hint.clone()).unwrap_err()
+            else {
+                panic!("stale bridge hints must return an LSP error");
+            };
+            assert_eq!(source.code, -32801);
+            app.invalidate_proof(&document.uri);
+            let lsp::ReplyError::Native { source } = request(app, "inlayHint/resolve", hint).unwrap_err() else {
+                panic!("reset bridge hints must return an LSP error");
+            };
+            assert_eq!(source.code, -32801);
+            let native = serde_json::from_str(
+                r#"{"position":{"line":0,"character":2},"label":"native","data":{"vendor":true}}"#,
+            )
+            .unwrap();
+            let lsp::ReplyError::Native { source } = request(app, "inlayHint/resolve", native).unwrap_err() else {
+                panic!("unsupported native resolution must not reach VsRocq");
+            };
+            assert_eq!(source.code, -32601);
+            assert!(app.pending.is_empty());
+        });
+    }
+
+    #[test]
+    fn rejected_global_refresh_responses_are_private_and_do_not_stop_hint_requests() {
+        with_app(|app| {
+            let id = "vsrocq-private-refresh".to_string();
+            app.client_requests.insert(id.clone(), ClientRequest::InlayRefresh);
+            app.client(Message::Response(protocol::failure(
+                Id::String(id),
+                -32601,
+                "refresh not supported",
+            )))
+            .unwrap();
+            assert!(app.client_requests.is_empty());
+            assert!(inlays(app, "file:///proof.v", Position::new(0, 0), Position::new(0, 0)).is_empty());
+        });
+    }
+
+    #[test]
+    fn editor_proof_actions_auto_open_one_tab_but_explicit_open_remains_available() {
+        for command in [
+            "step-forward",
+            "step-backward",
+            "run-to-cursor",
+            "run-to-end",
+            "interrupt",
+            "reset",
+        ] {
+            assert!(should_open_browser(true, Source::Editor, command, true, false));
+            assert!(!should_open_browser(true, Source::Editor, command, true, true));
+            assert!(!should_open_browser(true, Source::Editor, command, false, false));
+            assert!(!should_open_browser(false, Source::Editor, command, true, false));
+            assert!(!should_open_browser(true, Source::Browser, command, true, false));
+        }
+        assert!(should_open_browser(true, Source::Editor, "open", false, true));
+        assert!(!should_open_browser(true, Source::Browser, "open", true, false));
     }
 }

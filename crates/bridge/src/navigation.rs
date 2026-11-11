@@ -41,6 +41,9 @@ pub(crate) enum Error {
     #[snafu(display("VsRocq documentState row was not captured"))]
     MissingRowCapture,
 
+    #[snafu(display("VsRocq parsing-error offset {value} is out of range"))]
+    ParsingErrorStart { value: String, source: ParseIntError },
+
     #[snafu(display("VsRocq sentence ID {value} is out of range"))]
     SentenceId { value: String, source: ParseIntError },
 
@@ -91,6 +94,7 @@ struct Sentence {
 pub(crate) struct Navigation {
     sentences: Vec<Sentence>,
     current: Option<usize>,
+    parse_error: Option<usize>,
 }
 
 impl Navigation {
@@ -104,11 +108,16 @@ impl Navigation {
         let (by_id, by_end) = state
             .split_once("\nDocument using sentences_by_end map\n")
             .context(MissingSentenceMapSnafu)?;
-        let sentences = parse_map(document, by_id)?;
-        ensure!(sentences == parse_map(document, by_end)?, SentenceMapMismatchSnafu);
+        let (sentences, parse_error) = parse_map(document, by_id)?;
+        let (other_sentences, other_error) = parse_map(document, by_end)?;
+        ensure!(
+            sentences == other_sentences && parse_error == other_error,
+            SentenceMapMismatchSnafu
+        );
         Ok(Self {
             sentences,
             current: None,
+            parse_error,
         })
     }
 
@@ -142,6 +151,26 @@ impl Navigation {
         }
     }
 
+    pub(crate) fn checked(&self, document: &Document, processed: &[Range]) -> Result<Option<Position>> {
+        let mut checked = None;
+        for sentence in &self.sentences {
+            if self.parse_error.is_some_and(|error| sentence.stop > error) {
+                break;
+            }
+            let start = document
+                .position_at(sentence.start)
+                .context(SentencePositionSnafu { sentence: sentence.id })?;
+            let end = document
+                .position_at(sentence.stop)
+                .context(SentencePositionSnafu { sentence: sentence.id })?;
+            if !processed.iter().any(|range| range.start <= start && end <= range.end) {
+                break;
+            }
+            checked = Some(end);
+        }
+        Ok(checked)
+    }
+
     pub(crate) fn blocked(&mut self, document: &Document, range: Range) -> Result<()> {
         let stop = document.byte_offset(range.end).context(BlockedPositionSnafu)?;
         let Some(current) = self.current else {
@@ -160,21 +189,29 @@ impl Navigation {
     }
 }
 
-fn parse_map(document: &Document, mut text: &str) -> Result<Vec<Sentence>> {
+fn parse_map(document: &Document, mut text: &str) -> Result<(Vec<Sentence>, Option<usize>)> {
     static ROW: LazyLock<Regex> = LazyLock::new(|| {
         Regex::new(
-        r"(?s)\A(?:\[(?P<id>[0-9]+)\] .*? \((?P<start>[0-9]+) -> (?P<stop>[0-9]+)\) \((?:executed(?: in worker)?|not executed)\)|\(\* comment \*\) \(comment\)|\[parsing error\] .*? \([0-9]+ -> [0-9]+\) \(error\))(?:\n|\z)"
+        r"(?s)\A(?:\[(?P<id>[0-9]+)\] .*? \((?P<start>[0-9]+) -> (?P<stop>[0-9]+)\) \((?:executed(?: in worker)?|not executed)\)|\(\* comment \*\) \(comment\)|\[parsing error\] .*? \((?P<error_start>[0-9]+) -> [0-9]+\) \(error\))(?:\n|\z)"
     ).expect("the fixed document-state row pattern is valid")
     });
     let mut sentences: Vec<Sentence> = Vec::new();
     let mut ids = HashSet::new();
+    let mut parse_error = None;
     loop {
         text = text.trim_start_matches('\n');
         if text.is_empty() {
-            return Ok(sentences);
+            return Ok((sentences, parse_error));
         }
         let captures = ROW.captures(text).context(UnknownRowFormatSnafu)?;
         let whole = captures.get(0).context(MissingRowCaptureSnafu)?;
+        if let Some(start) = captures.name("error_start") {
+            let start = start
+                .as_str()
+                .parse::<usize>()
+                .context(ParsingErrorStartSnafu { value: start.as_str() })?;
+            parse_error = Some(parse_error.map_or(start, |earlier: usize| earlier.min(start)));
+        }
         if let Some(id) = captures.name("id") {
             let id = id
                 .as_str()
@@ -293,6 +330,56 @@ mod tests {
         continuing.target(&doc, "run-to-end", None).unwrap();
         let target = continuing.target(&doc, "step-backward", None).unwrap();
         assert!(matches!(target, Target::Sentence(range) if range.end == (Position { line: 0, character: 10 })));
+    }
+
+    #[test]
+    fn checked_frontier_requires_every_preceding_sentence_not_just_the_furthest_worker() {
+        let doc = document("Check nat.\nCheck bool.\nCheck unit.");
+        let rows = "[1] [Check--nat--.] (0 -> 10) (executed)\n[2] [Check--bool--.] (11 -> 22) (not executed)\n[3] \
+                    [Check--unit--.] (23 -> 34) (executed in worker)";
+        let navigation = Navigation::parse(&doc, &dump(rows)).unwrap();
+        let first = super::Range::new(Position::new(0, 0), Position::new(0, 10));
+        let second = super::Range::new(Position::new(1, 0), Position::new(1, 11));
+        let third = super::Range::new(Position::new(2, 0), Position::new(2, 11));
+        assert_eq!(navigation.checked(&doc, &[third]).unwrap(), None);
+        assert_eq!(
+            navigation.checked(&doc, &[third, first]).unwrap(),
+            Some(Position::new(0, 10))
+        );
+        assert_eq!(
+            navigation.checked(&doc, &[third, first, second]).unwrap(),
+            Some(Position::new(2, 11))
+        );
+        let partial = super::Range::new(Position::new(0, 0), Position::new(0, 9));
+        assert_eq!(navigation.checked(&doc, &[partial, second, third]).unwrap(), None);
+    }
+
+    #[test]
+    fn checked_frontier_uses_server_sentence_boundaries_and_utf16_after_comments() {
+        let doc = document("(* c *)\nCheck \"\u{1f9a4}\".");
+        let navigation = Navigation::parse(
+            &doc,
+            &dump("(* comment *) (comment)\n[1] [Check--string--.] (8 -> 21) (executed)"),
+        )
+        .unwrap();
+        let processed = super::Range::new(Position::new(1, 0), Position::new(1, 11));
+        assert_eq!(
+            navigation.checked(&doc, &[processed]).unwrap(),
+            Some(Position::new(1, 11))
+        );
+    }
+
+    #[test]
+    fn checked_frontier_never_skips_a_parser_error_as_if_it_were_a_comment() {
+        let doc = document("Check nat.\nFail.\nCheck bool.");
+        let rows = "[1] [Check--nat--.] (0 -> 10) (executed)\n[parsing error] broken (11 -> 16) (error)\n[3] \
+                    [Check--bool--.] (17 -> 28) (executed in worker)";
+        let navigation = Navigation::parse(&doc, &dump(rows)).unwrap();
+        let processed = super::Range::new(Position::new(0, 0), Position::new(2, 11));
+        assert_eq!(
+            navigation.checked(&doc, &[processed]).unwrap(),
+            Some(Position::new(0, 10))
+        );
     }
 
     #[test]

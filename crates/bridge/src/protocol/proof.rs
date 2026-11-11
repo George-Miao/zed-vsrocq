@@ -28,6 +28,15 @@ impl ProofView {
     }
 }
 
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct Highlights {
+    pub(crate) uri: String,
+    pub(crate) prepared_range: Vec<Range>,
+    pub(crate) processing_range: Vec<Range>,
+    pub(crate) processed_range: Vec<Range>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct Goals<G> {
@@ -448,6 +457,41 @@ impl<'de> Visitor<'de> for LineVisitor {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn highlight_snapshots_use_the_native_singular_range_fields() {
+        let snapshot: Highlights = serde_json::from_str(
+            r#"{
+                "uri":"file:///proof.v",
+                "preparedRange":[{"start":{"line":0,"character":0},"end":{"line":1,"character":3}}],
+                "processingRange":[{"start":{"line":1,"character":3},"end":{"line":2,"character":4}}],
+                "processedRange":[{"start":{"line":0,"character":0},"end":{"line":1,"character":3}}],
+                "futureHighlights":true
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(snapshot.uri, "file:///proof.v");
+        assert_eq!(snapshot.prepared_range.len(), 1);
+        assert_eq!(snapshot.processing_range[0].start.line, 1);
+        assert_eq!(snapshot.processing_range[0].end.character, 4);
+        assert_eq!(snapshot.processed_range[0].end.line, 1);
+        assert_eq!(snapshot.processed_range[0].end.character, 3);
+    }
+
+    #[test]
+    fn highlight_snapshots_require_all_three_range_sets() {
+        assert!(
+            serde_json::from_str::<Highlights>(r#"{"uri":"file:///proof.v","processingRange":[],"processedRange":[]}"#)
+                .is_err()
+        );
+        let snapshot: Highlights = serde_json::from_str(
+            r#"{"uri":"file:///proof.v","preparedRange":[],"processingRange":[],"processedRange":[]}"#,
+        )
+        .unwrap();
+        assert!(snapshot.prepared_range.is_empty());
+        assert!(snapshot.processing_range.is_empty());
+        assert!(snapshot.processed_range.is_empty());
+    }
 
     #[test]
     fn pretty_print_commands_keep_their_tagged_array_encoding() {
