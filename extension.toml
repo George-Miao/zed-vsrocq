@@ -1,6 +1,6 @@
 id = "vsrocq"
 name = "VsRocq"
-version = "0.1.0"
+version = "0.2.0-beta.1"
 schema_version = 1
 authors = ["George Miao <gm@miao.dev>"]
 description = "Rocq language support"
