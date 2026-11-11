@@ -123,7 +123,9 @@ pub enum Display {
 record! {
     Command ("server.") {
         fields {
+            /// Select the Rocq language-server executable.
             path: Option<String> => "path";
+            /// Supply arguments for the Rocq language server.
             args: Vec<String> => "args";
         }
         sections {}
@@ -133,9 +135,13 @@ record! {
 record! {
     Bridge ("bridge.") {
         fields {
+            /// Select a local bridge executable instead of downloading one.
             path: Option<String> => "path";
+            /// Select the GitHub repository for bridge downloads.
             release_repository: Option<String> => "release_repository";
+            /// Select a release tag, including a pre-release tag.
             release_tag: Option<String> => "release_tag";
+            /// Download the bridge from this HTTPS URL.
             download_url: Option<String> => "download_url";
         }
         sections {}
@@ -155,8 +161,10 @@ record! {
             delegation: Delegation => "delegation";
             workers: Option<i64> => "workers";
             mode: ProofMode => "mode";
+            /// Stop at the first proof error.
             block: bool => "block";
             point_interpretation_mode: PointInterpretation => "pointInterpretationMode";
+            /// Open the browser once per language-server session.
             auto_open: bool => "autoOpen";
             display_buttons: bool => "display-buttons";
         }

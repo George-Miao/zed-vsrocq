@@ -21,6 +21,8 @@ Open a `.v` file as Rocq. Open Zed's code-action menu and select a `VsRocq:` act
 
 The first proof command opens the browser by default. Other proof commands use the same view. Select `Open proof view` to open it again.
 
+If the browser reports `Command blocked`, use the proof actions in Zed. If it reports `Session link rejected`, select `Open proof view` in Zed to get a new link.
+
 ### `.v` association
 
 This extension associates `.v` files to Rocq. Verilog also uses that file extension. If both extensions are installed, select Rocq for proof files or set a project-level language association.
@@ -76,6 +78,8 @@ The following keys are relative to `settings`:
 
 Zed's `lsp.vsrocq.binary.path` can also select a bridge executable. Use `vsrocq-bridge.exe` on Windows.
 
+Stable Zed does not support custom extension settings schemas. These settings work without schema completion.
+
 ## Development
 
 Use the Nix development shell on Linux or macOS:
@@ -89,5 +93,7 @@ check-project
 ```
 
 The flake uses `numtide/devshell` and supplies the Rust and Rocq toolchains and Bun.
+
+The extension pins the released Zed API 0.7.0 source to a fixed Git revision. Unreleased APIs require a development build of Zed.
 
 To load the local extension, run `zed: extensions`, select `Install Dev Extension`, and select this directory. Start Zed from the development shell so that it can find the proof toolchain.
